@@ -1,3 +1,4 @@
+#include "physics.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dwmapi.h>
@@ -8,10 +9,6 @@
 #include <string.h>
 #include <windows.h>
 
-
-#ifndef EVENT_OBJECT_CLOAKED
-#define EVENT_OBJECT_CLOAKED 0x8017
-#endif
 
 STDAPI DCompositionCreateDevice(IDXGIDevice *dxgiDevice, REFIID iid,
                                 void **dcompositionDevice);
@@ -35,10 +32,8 @@ static const GUID IID_DCompDevice = {
 
 #define RING_CAP 16
 #define MAX_TRACKED 256
-#define SHARD_COLS 8
-#define SHARD_ROWS 6
-#define TRIS_PER_WIN (SHARD_COLS * SHARD_ROWS * 2)
 #define MAX_GROUPS 12
+#define MAX_VB_VERTS (PHYS_MAX_CUBES * 6)
 
 struct ring_slot {
     ID3D11Texture2D *tex;
@@ -50,43 +45,49 @@ struct tracked_win {
     RECT rc;
 };
 
-struct shard_tri {
-    float lx[3], ly[3];
-    float u[3], v[3];
-    float x, y;
-    float vx, vy;
-    float ang, ang_v;
-    float alpha;
-};
-
 struct shard_group {
     int active;
     float life;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
-    struct shard_tri tris[TRIS_PER_WIN];
 };
 
 struct shard_vert {
     float x, y;
     float u, v;
+    float qx, qy;
     float alpha;
 };
 
-static const char HLSL_SRC[] = "Texture2D tex0 : register(t0);\n"
-                               "SamplerState smp0 : register(s0);\n"
-                               "struct VSIn { float2 pos : POSITION; float2 uv "
-                               ": TEXCOORD0; float a : COLOR0; };\n"
-                               "struct PSIn { float4 pos : SV_POSITION; float2 "
-                               "uv : TEXCOORD0; float a : COLOR0; };\n"
-                               "PSIn vs_main(VSIn i) {\n"
-                               "    PSIn o; o.pos = float4(i.pos, 0.0, 1.0); "
-                               "o.uv = i.uv; o.a = i.a; return o;\n"
-                               "}\n"
-                               "float4 ps_main(PSIn i) : SV_TARGET {\n"
-                               "    float4 c = tex0.Sample(smp0, i.uv);\n"
-                               "    return float4(c.rgb * i.a, i.a);\n"
-                               "}\n";
+static const char HLSL_SRC[] =
+    "Texture2D tex0 : register(t0);\n"
+    "SamplerState smp0 : register(s0);\n"
+    "struct VSIn {\n"
+    "    float2 pos : POSITION;\n"
+    "    float2 uv  : TEXCOORD0;\n"
+    "    float2 q   : TEXCOORD1;\n"
+    "    float  a   : COLOR0;\n"
+    "};\n"
+    "struct PSIn {\n"
+    "    float4 pos : SV_POSITION;\n"
+    "    float2 uv  : TEXCOORD0;\n"
+    "    float2 q   : TEXCOORD1;\n"
+    "    float  a   : COLOR0;\n"
+    "};\n"
+    "PSIn vs_main(VSIn i) {\n"
+    "    PSIn o;\n"
+    "    o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.uv = i.uv; o.q = i.q; o.a = i.a;\n"
+    "    return o;\n"
+    "}\n"
+    "float4 ps_main(PSIn i) : SV_TARGET {\n"
+    "    float4 c = tex0.Sample(smp0, i.uv);\n"
+    "    float edge = max(abs(i.q.x), abs(i.q.y));\n"
+    "    float bevel = smoothstep(0.84, 0.98, edge);\n"
+    "    float lit = (i.q.x + i.q.y < 0.0) ? 0.28 : -0.22;\n"
+    "    float3 col = saturate(c.rgb + lit * bevel);\n"
+    "    return float4(col * i.a, i.a);\n"
+    "}\n";
 
 static ID3D11Device *g_d3d;
 static ID3D11DeviceContext *g_ctx;
@@ -96,7 +97,6 @@ static IDXGIOutput1 *g_output1;
 static IDXGIOutputDuplication *g_dupl;
 static RECT g_out_rc;
 static int g_vx, g_vy, g_vw, g_vh;
-static float g_work_bottom;
 
 static ID3D11VertexShader *g_vs;
 static ID3D11PixelShader *g_ps;
@@ -114,6 +114,7 @@ static uint64_t g_qpc_freq;
 static struct tracked_win g_wins[MAX_TRACKED];
 static int g_win_count;
 static struct shard_group g_groups[MAX_GROUPS];
+static struct phys_world g_phys;
 static int g_need_clear;
 
 static uint64_t now_ms(void) {
@@ -124,14 +125,6 @@ static uint64_t now_ms(void) {
 
 static float frand(float lo, float hi) {
     return lo + ((float)rand() / (float)RAND_MAX) * (hi - lo);
-}
-
-static int find_win(HWND hwnd) {
-    for (int i = 0; i < g_win_count; i++) {
-        if (g_wins[i].hwnd == hwnd)
-            return i;
-    }
-    return -1;
 }
 
 static int is_ignored_win(HWND hwnd) {
@@ -202,12 +195,16 @@ static int is_ignored_win(HWND hwnd) {
     return 0;
 }
 
+static int find_win(HWND hwnd) {
+    for (int i = 0; i < g_win_count; i++) {
+        if (g_wins[i].hwnd == hwnd)
+            return i;
+    }
+    return -1;
+}
+
 static void upsert_win(HWND hwnd) {
     if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || is_ignored_win(hwnd))
-        return;
-    if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD)
-        return;
-    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
         return;
 
     DWORD cloaked = 0;
@@ -278,14 +275,25 @@ static void spawn_shatter(RECT rc) {
         return;
 
     int slot = -1;
+    float min_life = 9999.0f;
+    int oldest_slot = 0;
     for (int i = 0; i < MAX_GROUPS; i++) {
         if (!g_groups[i].active) {
             slot = i;
             break;
         }
+        if (g_groups[i].life < min_life) {
+            min_life = g_groups[i].life;
+            oldest_slot = i;
+        }
     }
-    if (slot < 0)
-        return;
+    if (slot < 0) {
+        slot = oldest_slot;
+        phys_clear_group(&g_phys, slot);
+        ID3D11ShaderResourceView_Release(g_groups[slot].srv);
+        ID3D11Texture2D_Release(g_groups[slot].tex);
+        g_groups[slot].active = 0;
+    }
 
     D3D11_TEXTURE2D_DESC td = {0};
     td.Width = (UINT)w;
@@ -329,76 +337,48 @@ static void spawn_shatter(RECT rc) {
         iy = (float)cur.y;
     }
 
-    float gx[SHARD_ROWS + 1][SHARD_COLS + 1];
-    float gy[SHARD_ROWS + 1][SHARD_COLS + 1];
-    float cw = (float)w / (float)SHARD_COLS;
-    float ch = (float)h / (float)SHARD_ROWS;
+    float target = sqrtf(((float)w * (float)h) / 56.0f);
+    if (target < 48.0f)
+        target = 48.0f;
+    int cols = (int)((float)w / target + 0.5f);
+    int rows = (int)((float)h / target + 0.5f);
+    if (cols < 2)
+        cols = 2;
+    if (cols > 12)
+        cols = 12;
+    if (rows < 2)
+        rows = 2;
+    if (rows > 10)
+        rows = 10;
 
-    for (int r = 0; r <= SHARD_ROWS; r++) {
-        for (int c = 0; c <= SHARD_COLS; c++) {
-            float px = (float)c * cw;
-            float py = (float)r * ch;
-            if (c > 0 && c < SHARD_COLS)
-                px += frand(-0.35f * cw, 0.35f * cw);
-            if (r > 0 && r < SHARD_ROWS)
-                py += frand(-0.35f * ch, 0.35f * ch);
-            gx[r][c] = px;
-            gy[r][c] = py;
-        }
-    }
+    float cw = (float)w / (float)cols;
+    float ch = (float)h / (float)rows;
+    float hw = cw * 0.5f;
+    float hh = ch * 0.5f;
 
-    struct shard_group *grp = &g_groups[slot];
-    grp->active = 1;
-    grp->life = 1.6f;
-    grp->tex = wtex;
-    grp->srv = wsrv;
+    g_groups[slot].active = 1;
+    g_groups[slot].life = 5.0f;
+    g_groups[slot].tex = wtex;
+    g_groups[slot].srv = wsrv;
 
-    int ti = 0;
-    for (int r = 0; r < SHARD_ROWS; r++) {
-        for (int c = 0; c < SHARD_COLS; c++) {
-            int p_idx[2][3][2] = {{{r, c}, {r, c + 1}, {r + 1, c + 1}},
-                                  {{r, c}, {r + 1, c + 1}, {r + 1, c}}};
-            if ((r + c) & 1) {
-                p_idx[0][2][0] = r + 1;
-                p_idx[0][2][1] = c;
-                p_idx[1][0][0] = r;
-                p_idx[1][0][1] = c + 1;
-            }
-            for (int t = 0; t < 2; t++) {
-                struct shard_tri *st = &grp->tris[ti++];
-                float sx = 0.0f, sy = 0.0f;
-                for (int k = 0; k < 3; k++) {
-                    int pr = p_idx[t][k][0];
-                    int pc = p_idx[t][k][1];
-                    sx += (float)cl.left + gx[pr][pc];
-                    sy += (float)cl.top + gy[pr][pc];
-                }
-                st->x = sx / 3.0f;
-                st->y = sy / 3.0f;
-
-                for (int k = 0; k < 3; k++) {
-                    int pr = p_idx[t][k][0];
-                    int pc = p_idx[t][k][1];
-                    float wx = (float)cl.left + gx[pr][pc];
-                    float wy = (float)cl.top + gy[pr][pc];
-                    st->lx[k] = wx - st->x;
-                    st->ly[k] = wy - st->y;
-                    st->u[k] = gx[pr][pc] / (float)w;
-                    st->v[k] = gy[pr][pc] / (float)h;
-                }
-
-                float dx = st->x - ix;
-                float dy = st->y - iy;
-                float dist = sqrtf(dx * dx + dy * dy) + 1.0f;
-                float force = 520.0f / (1.0f + dist * 0.004f);
-                st->vx = (dx / dist) * force * frand(0.6f, 1.35f) +
-                         frand(-80.0f, 80.0f);
-                st->vy = (dy / dist) * force * frand(0.6f, 1.35f) -
-                         frand(60.0f, 220.0f);
-                st->ang = 0.0f;
-                st->ang_v = frand(-7.0f, 7.0f);
-                st->alpha = 1.0f;
-            }
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            float cx = (float)cl.left + ((float)c + 0.5f) * cw;
+            float cy = (float)cl.top + ((float)r + 0.5f) * ch;
+            float dx = cx - ix;
+            float dy = cy - iy;
+            float dist = sqrtf(dx * dx + dy * dy) + 1.0f;
+            float force = 620.0f / (1.0f + dist * 0.003f);
+            float vx = (dx / dist) * force * frand(0.6f, 1.35f) +
+                       frand(-120.0f, 120.0f);
+            float vy =
+                (dy / dist) * force * frand(0.6f, 1.35f) - frand(80.0f, 260.0f);
+            float u0 = (float)c / (float)cols;
+            float v0 = (float)r / (float)rows;
+            float u1 = (float)(c + 1) / (float)cols;
+            float v1 = (float)(r + 1) / (float)rows;
+            phys_spawn_cube(&g_phys, slot, cx, cy, hw, hh, vx, vy,
+                            frand(-8.0f, 8.0f), u0, v0, u1, v1);
         }
     }
 }
@@ -418,8 +398,7 @@ static void CALLBACK on_win_event(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
         return;
     }
 
-    if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE ||
-        event == EVENT_OBJECT_CLOAKED) {
+    if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE) {
         int idx = find_win(hwnd);
         if (idx < 0)
             return;
@@ -487,6 +466,12 @@ static int step_and_render(float dt) {
     if (!any_active && !g_need_clear)
         return 0;
 
+    if (any_active) {
+        POINT cur;
+        GetCursorPos(&cur);
+        phys_step(&g_phys, dt, (float)cur.x, (float)cur.y);
+    }
+
     float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &g_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(g_ctx, g_rtv, clear);
@@ -507,20 +492,21 @@ static int step_and_render(float dt) {
         ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_samp);
         ID3D11DeviceContext_OMSetBlendState(g_ctx, g_blend, NULL, 0xFFFFFFFF);
 
-        for (int i = 0; i < MAX_GROUPS; i++) {
-            struct shard_group *grp = &g_groups[i];
+        for (int g = 0; g < MAX_GROUPS; g++) {
+            struct shard_group *grp = &g_groups[g];
             if (!grp->active)
                 continue;
 
             grp->life -= dt;
             if (grp->life <= 0.0f) {
                 grp->active = 0;
+                phys_clear_group(&g_phys, g);
                 ID3D11ShaderResourceView_Release(grp->srv);
                 ID3D11Texture2D_Release(grp->tex);
                 continue;
             }
 
-            float fade = grp->life < 0.45f ? grp->life / 0.45f : 1.0f;
+            float fade = grp->life < 0.8f ? grp->life / 0.8f : 1.0f;
             D3D11_MAPPED_SUBRESOURCE mapped;
             if (FAILED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_vb, 0,
                                                D3D11_MAP_WRITE_DISCARD, 0,
@@ -529,36 +515,43 @@ static int step_and_render(float dt) {
 
             struct shard_vert *verts = (struct shard_vert *)mapped.pData;
             int vc = 0;
-            for (int t = 0; t < TRIS_PER_WIN; t++) {
-                struct shard_tri *st = &grp->tris[t];
-                st->vy += 1750.0f * dt;
-                st->x += st->vx * dt;
-                st->y += st->vy * dt;
-                st->ang += st->ang_v * dt;
-                if (st->y > g_work_bottom) {
-                    st->y = g_work_bottom;
-                    st->vy = -st->vy * 0.38f;
-                    st->vx *= 0.82f;
-                    st->ang_v *= 0.65f;
-                }
-                float cs = cosf(st->ang);
-                float sn = sinf(st->ang);
-                for (int k = 0; k < 3; k++) {
-                    float wx = st->x + st->lx[k] * cs - st->ly[k] * sn;
-                    float wy = st->y + st->lx[k] * sn + st->ly[k] * cs;
+            for (int i = 0; i < PHYS_MAX_CUBES; i++) {
+                const struct phys_cube *c = &g_phys.cubes[i];
+                if (!c->active || c->group_id != g)
+                    continue;
+
+                float cs = cosf(c->ang);
+                float sn = sinf(c->ang);
+                float lx[4] = {-c->hw, c->hw, c->hw, -c->hw};
+                float ly[4] = {-c->hh, -c->hh, c->hh, c->hh};
+                float cu[4] = {c->u0, c->u1, c->u1, c->u0};
+                float cv[4] = {c->v0, c->v0, c->v1, c->v1};
+                float qx[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
+                float qy[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
+                int tri_idx[6] = {0, 1, 2, 0, 2, 3};
+
+                for (int k = 0; k < 6; k++) {
+                    int ci = tri_idx[k];
+                    float wx = c->x + lx[ci] * cs - ly[ci] * sn;
+                    float wy = c->y + lx[ci] * sn + ly[ci] * cs;
                     verts[vc].x =
                         ((wx - (float)g_vx) / (float)g_vw) * 2.0f - 1.0f;
                     verts[vc].y =
                         1.0f - ((wy - (float)g_vy) / (float)g_vh) * 2.0f;
-                    verts[vc].u = st->u[k];
-                    verts[vc].v = st->v[k];
+                    verts[vc].u = cu[ci];
+                    verts[vc].v = cv[ci];
+                    verts[vc].qx = qx[ci];
+                    verts[vc].qy = qy[ci];
                     verts[vc].alpha = fade;
                     vc++;
                 }
             }
             ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)g_vb, 0);
-            ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &grp->srv);
-            ID3D11DeviceContext_Draw(g_ctx, (UINT)vc, 0);
+            if (vc > 0) {
+                ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1,
+                                                         &grp->srv);
+                ID3D11DeviceContext_Draw(g_ctx, (UINT)vc, 0);
+            }
         }
         g_need_clear = 1;
     } else {
@@ -591,7 +584,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 
     RECT work_rc;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_rc, 0);
-    g_work_bottom = (float)work_rc.bottom;
+    struct phys_rect bounds = {(float)work_rc.left, (float)work_rc.top,
+                               (float)work_rc.right, (float)work_rc.bottom};
+    phys_init(&g_phys, bounds);
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
@@ -697,16 +692,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                                        0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
                                       {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,
                                        0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
-                                      {"COLOR", 0, DXGI_FORMAT_R32_FLOAT, 0, 16,
+                                      {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,
+                                       0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                      {"COLOR", 0, DXGI_FORMAT_R32_FLOAT, 0, 24,
                                        D3D11_INPUT_PER_VERTEX_DATA, 0}};
     ID3D11Device_CreateInputLayout(
-        g_d3d, ied, 3, ID3D10Blob_GetBufferPointer(vs_blob),
+        g_d3d, ied, 4, ID3D10Blob_GetBufferPointer(vs_blob),
         ID3D10Blob_GetBufferSize(vs_blob), &g_layout);
     ID3D10Blob_Release(vs_blob);
     ID3D10Blob_Release(ps_blob);
 
     D3D11_BUFFER_DESC bd = {0};
-    bd.ByteWidth = sizeof(struct shard_vert) * TRIS_PER_WIN * 3;
+    bd.ByteWidth = sizeof(struct shard_vert) * MAX_VB_VERTS;
     bd.Usage = D3D11_USAGE_DYNAMIC;
     bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -741,8 +738,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                     0, 0, hook_flags);
     SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
                     NULL, on_win_event, 0, 0, hook_flags);
-    SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CLOAKED, NULL,
-                    on_win_event, 0, 0, hook_flags);
     SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL,
                     on_win_event, 0, 0, hook_flags);
 
