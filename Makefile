@@ -19,7 +19,7 @@ all: $(BIN)
 debug: CFLAGS += -g -O0 -DDEBUG
 debug: $(BIN)
 
-$(BIN): $(SRC) Makefile
+$(BIN): $(SRC) physics.h Makefile
 	$(CC) $(CFLAGS) $(SRC) -o $(BIN) $(LDFLAGS)
 
 run: all
